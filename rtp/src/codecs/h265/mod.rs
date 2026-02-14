@@ -1,61 +1,23 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
-use super::h264::ANNEXB_NALUSTART_CODE;
 use crate::error::{Error, Result};
 use crate::packetizer::{Depacketizer, Payloader};
 
 #[cfg(test)]
 mod h265_test;
 
-pub static ANNEXB_3_NALUSTART_CODE: Bytes = Bytes::from_static(&[0x00, 0x00, 0x01]);
-pub static SING_PAYLOAD_HDR: Bytes = Bytes::from_static(&[0x1C, 0x01]);
-pub static AGGR_PAYLOAD_HDR: Bytes = Bytes::from_static(&[0x60, 0x01]);
-pub static FRAG_PAYLOAD_HDR: Bytes = Bytes::from_static(&[0x62, 0x01]);
-pub static FU_HDR_IDR_S: u8 = 0x93;
-pub static FU_HDR_IDR_M: u8 = 0x13;
-pub static FU_HDR_IDR_E: u8 = 0x53;
-pub static FU_HDR_P_S: u8 = 0x81;
-pub static FU_HDR_P_M: u8 = 0x01;
-pub static FU_HDR_P_E: u8 = 0x41;
-pub static FU_HDR_B_S: u8 = 0x80;
-pub static FU_HDR_B_M: u8 = 0x00;
-pub static FU_HDR_B_E: u8 = 0x40;
 pub const RTP_OUTBOUND_MTU: usize = 1200;
 pub const H265FRAGMENTATION_UNIT_HEADER_SIZE: usize = 1;
 pub const NAL_HEADER_SIZE: usize = 2;
 
-#[derive(PartialEq, Hash, Debug, Copy, Clone)]
-pub enum UnitType {
-    VPS = 32,
-    SPS = 33,
-    PPS = 34,
-    CRA = 21,
-    SEI = 39,
-    IDR = 19,
-    PFR = 1,
-    BFR = 0,
-    IGNORE = -1,
-}
-impl UnitType {
-    pub fn for_id(id: u8) -> Result<UnitType> {
-        if id > 64 {
-            Err(Error::ErrUnhandledNaluType)
-        } else {
-            let t = match id {
-                32 => UnitType::VPS,
-                33 => UnitType::SPS,
-                34 => UnitType::PPS,
-                21 => UnitType::CRA,
-                39 => UnitType::SEI,
-                19 => UnitType::IDR,
-                1 => UnitType::PFR,
-                0 => UnitType::BFR,
-                _ => UnitType::IGNORE, // shouldn't happen
-            };
-            Ok(t)
-        }
-    }
-}
+/// HEVC NAL unit types (ITU-T H.265 Table 7-1)
+const NAL_TYPE_VPS: u8 = 32;
+const NAL_TYPE_SPS: u8 = 33;
+const NAL_TYPE_PPS: u8 = 34;
+const NAL_TYPE_AUD: u8 = 35;
+/// RTP packetization types (RFC 7798)
+const NAL_TYPE_AP: u8 = 48;
+const NAL_TYPE_FU: u8 = 49;
 
 #[derive(Default, Debug, Clone)]
 pub struct HevcPayloader {
@@ -65,43 +27,56 @@ pub struct HevcPayloader {
 }
 
 impl HevcPayloader {
-    pub fn parse(nalu: &Bytes) -> (Vec<usize>, usize) {
-        let finder = memchr::memmem::Finder::new(&ANNEXB_NALUSTART_CODE);
-        let nals = finder.find_iter(nalu).collect::<Vec<usize>>();
-        if nals.is_empty() {
-            let finder = memchr::memmem::Finder::new(&ANNEXB_3_NALUSTART_CODE);
-            return (finder.find_iter(nalu).collect::<Vec<usize>>(), 3);
+    /// Find the next Annex B start code (supports both 3-byte and 4-byte).
+    /// Returns (start_position, start_code_length) or (-1, -1) if not found.
+    fn next_ind(data: &Bytes, start: usize) -> (isize, isize) {
+        let mut zero_count = 0;
+        for (i, &b) in data[start..].iter().enumerate() {
+            if b == 0 {
+                zero_count += 1;
+            } else if b == 1 && zero_count >= 2 {
+                return ((start + i - zero_count) as isize, zero_count as isize + 1);
+            } else {
+                zero_count = 0;
+            }
         }
-        (nals, 4)
+        (-1, -1)
     }
 
     fn emit(&mut self, nalu: &Bytes, mtu: usize, payloads: &mut Vec<Bytes>) {
-        if nalu.is_empty() {
+        if nalu.len() < NAL_HEADER_SIZE {
             return;
         }
-        let payload_header = H265NALUHeader::new(nalu[0], nalu[1]);
-        let payload_nalu_type = payload_header.nalu_type();
-        let nalu_type = UnitType::for_id(payload_nalu_type).unwrap_or(UnitType::IGNORE);
-        if nalu_type == UnitType::IGNORE {
+
+        let header = H265NALUHeader::new(nalu[0], nalu[1]);
+        let nal_type = header.nalu_type();
+
+        // Strip Access Unit Delimiters
+        if nal_type == NAL_TYPE_AUD {
             return;
-        } else if nalu_type == UnitType::VPS {
+        }
+
+        // Collect VPS/SPS/PPS for aggregation
+        if nal_type == NAL_TYPE_VPS {
             self.vps_nalu.replace(nalu.clone());
-        } else if nalu_type == UnitType::SPS {
+        } else if nal_type == NAL_TYPE_SPS {
             self.sps_nalu.replace(nalu.clone());
-        } else if nalu_type == UnitType::PPS {
+        } else if nal_type == NAL_TYPE_PPS {
             self.pps_nalu.replace(nalu.clone());
         }
+
+        // When all three parameter sets are collected, emit AP
         if let (Some(vps_nalu), Some(sps_nalu), Some(pps_nalu)) =
             (&self.vps_nalu, &self.sps_nalu, &self.pps_nalu)
         {
-            // Pack current NALU with SPS and PPS as STAP-A
             let vps_len = (vps_nalu.len() as u16).to_be_bytes();
             let sps_len = (sps_nalu.len() as u16).to_be_bytes();
             let pps_len = (pps_nalu.len() as u16).to_be_bytes();
 
-            // TODO DONL not impl yet
             let mut aggr_nalu = BytesMut::new();
-            aggr_nalu.extend_from_slice(&AGGR_PAYLOAD_HDR);
+            // AP header: type=48, TID=1
+            aggr_nalu.put_u8(NAL_TYPE_AP << 1);
+            aggr_nalu.put_u8(0x01);
             aggr_nalu.extend_from_slice(&vps_len);
             aggr_nalu.extend_from_slice(vps_nalu);
             aggr_nalu.extend_from_slice(&sps_len);
@@ -115,78 +90,58 @@ impl HevcPayloader {
                 self.pps_nalu.take();
                 return;
             }
-        } else if nalu_type == UnitType::VPS
-            || nalu_type == UnitType::SPS
-            || nalu_type == UnitType::PPS
-        {
+        } else if nal_type == NAL_TYPE_VPS || nal_type == NAL_TYPE_SPS || nal_type == NAL_TYPE_PPS {
             return;
         }
-        // if self.sps_nalu.is_some() && self.pps_nalu.is_some() {
-        //     self.sps_nalu = None;
-        //     self.pps_nalu = None;
-        // }
 
-        // Single NALU
+        // Single NALU packet
         if nalu.len() <= mtu {
             payloads.push(nalu.clone());
             return;
         }
+
+        // Fragmentation Unit (FU) - generic for ALL NAL types per RFC 7798
         let max_fragment_size =
             mtu as isize - NAL_HEADER_SIZE as isize - H265FRAGMENTATION_UNIT_HEADER_SIZE as isize;
-        let nalu_data = nalu;
-        let mut nalu_data_index = 2;
-        let nalu_data_length = nalu.len() as isize - nalu_data_index;
+        let nalu_data_length = nalu.len() as isize - 2;
         let mut nalu_data_remaining = nalu_data_length;
+        let mut nalu_data_index: isize = 2;
+
         if std::cmp::min(max_fragment_size, nalu_data_remaining) <= 0 {
             return;
         }
+
+        // FU PayloadHdr: Type=49, preserve F bit and TID from original
+        let fu_payload_hdr_0 = (NAL_TYPE_FU << 1) | (nalu[0] & 0x81);
+        let fu_payload_hdr_1 = nalu[1];
+
         while nalu_data_remaining > 0 {
             let current_fragment_size = std::cmp::min(max_fragment_size, nalu_data_remaining);
-            //out: = make([]byte, fuaHeaderSize + currentFragmentSize)
             let mut out = BytesMut::with_capacity(
-                H265FRAGMENTATION_UNIT_HEADER_SIZE + current_fragment_size as usize,
+                NAL_HEADER_SIZE
+                    + H265FRAGMENTATION_UNIT_HEADER_SIZE
+                    + current_fragment_size as usize,
             );
-            out.extend_from_slice(&FRAG_PAYLOAD_HDR);
+
+            // FU PayloadHdr (2 bytes)
+            out.put_u8(fu_payload_hdr_0);
+            out.put_u8(fu_payload_hdr_1);
+
+            // FU header: S(1) | E(1) | FuType(6) — uses actual NAL type from header
             let is_first = nalu_data_index == 2;
-            let is_last = !is_first && current_fragment_size < max_fragment_size;
-            /*
-            +---------------+
-            |0|1|2|3|4|5|6|7|
-            +-+-+-+-+-+-+-+-+
-            |S|E|  fu_type  |
-            +---------------+
-            */
-            if nalu_type == UnitType::IDR {
-                if is_first {
-                    out.put_u8(FU_HDR_IDR_S);
-                } else if is_last {
-                    out.put_u8(FU_HDR_IDR_E);
-                } else {
-                    out.put_u8(FU_HDR_IDR_M);
-                }
-            } else if nalu_type == UnitType::PFR {
-                if is_first {
-                    out.put_u8(FU_HDR_P_S);
-                } else if is_last {
-                    out.put_u8(FU_HDR_P_E);
-                } else {
-                    out.put_u8(FU_HDR_P_M);
-                }
-            } else if nalu_type == UnitType::BFR {
-                if is_first {
-                    out.put_u8(FU_HDR_B_S);
-                } else if is_last {
-                    out.put_u8(FU_HDR_B_E);
-                } else {
-                    out.put_u8(FU_HDR_B_M);
-                }
-            }
+            let is_last = nalu_data_remaining == current_fragment_size && !is_first;
+            let fu_header = if is_first {
+                0x80 | nal_type
+            } else if is_last {
+                0x40 | nal_type
+            } else {
+                nal_type
+            };
+            out.put_u8(fu_header);
 
             out.extend_from_slice(
-                &nalu_data
-                    [nalu_data_index as usize..(nalu_data_index + current_fragment_size) as usize],
+                &nalu[nalu_data_index as usize..(nalu_data_index + current_fragment_size) as usize],
             );
-            // println!("pkt payload {:?}", &out[0..5]);
             payloads.push(out.freeze());
 
             nalu_data_remaining -= current_fragment_size;
@@ -196,7 +151,7 @@ impl HevcPayloader {
 }
 
 impl Payloader for HevcPayloader {
-    /// Payload fragments a H264 packet across one or more byte arrays
+    /// Payload fragments a H265 packet across one or more byte arrays
     fn payload(&mut self, mtu: usize, payload: &Bytes) -> Result<Vec<Bytes>> {
         if payload.is_empty() || mtu == 0 {
             return Ok(vec![]);
@@ -204,23 +159,30 @@ impl Payloader for HevcPayloader {
 
         let mut payloads = vec![];
 
-        let (nal_idxs, offset) = HevcPayloader::parse(payload);
-        let nal_len = nal_idxs.len();
-        for (i, start) in nal_idxs.iter().enumerate() {
-            let end = if (i + 1) < nal_len {
-                nal_idxs[i + 1]
+        // Find first start code
+        let (mut start, mut sc_len) = HevcPayloader::next_ind(payload, 0);
+        if start < 0 {
+            // No start codes found, treat entire payload as single NALU
+            self.emit(payload, mtu, &mut payloads);
+            return Ok(payloads);
+        }
+
+        loop {
+            let nalu_start = (start + sc_len) as usize;
+            let (next_start, next_sc_len) = HevcPayloader::next_ind(payload, nalu_start);
+            if next_start < 0 {
+                // Last NALU
+                self.emit(&payload.slice(nalu_start..), mtu, &mut payloads);
+                break;
             } else {
-                payload.len()
-            };
-            // println!(
-            //     "start {}, end {} payload {:?}",
-            //     start,
-            //     end,
-            //     &payload
-            //         .slice((start + offset)..(start + offset + 5))
-            //         .to_vec()
-            // );
-            self.emit(&payload.slice((start + offset)..end), mtu, &mut payloads);
+                self.emit(
+                    &payload.slice(nalu_start..next_start as usize),
+                    mtu,
+                    &mut payloads,
+                );
+            }
+            start = next_start;
+            sc_len = next_sc_len;
         }
 
         Ok(payloads)
