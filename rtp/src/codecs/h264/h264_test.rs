@@ -261,3 +261,59 @@ fn test_h264_payloader_payload_sps_and_pps_handling() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_h264_payloader_mixed_annexb_start_codes() -> Result<()> {
+    // AMD AMF-style output: 4-byte start code for first NALU, 3-byte for rest
+    let mut pck = H264Payloader::default();
+
+    // AUD + SPS + PPS + IDR with mixed start codes (AMD AMF pattern)
+    let annexb_payload = Bytes::from_static(&[
+        // AUD (4-byte start code) - type 9
+        0x00, 0x00, 0x00, 0x01, 0x09, 0x10,
+        // SPS (3-byte start code) - type 7
+        0x00, 0x00, 0x01, 0x67, 0x42, 0xc0,
+        // PPS (3-byte start code) - type 8
+        0x00, 0x00, 0x01, 0x68, 0x1a, 0x34,
+        // IDR slice (3-byte start code) - type 5
+        0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb,
+    ]);
+
+    let result = pck.payload(1500, &annexb_payload)?;
+
+    // AUD should be stripped, SPS+PPS aggregated into STAP-A, IDR emitted separately
+    assert_eq!(result.len(), 2, "Expected STAP-A + IDR slice");
+
+    // First packet should be STAP-A
+    assert_eq!(
+        result[0][0] & NALU_TYPE_BITMASK,
+        STAPA_NALU_TYPE,
+        "First packet should be STAP-A"
+    );
+
+    // Second packet should be IDR slice
+    assert_eq!(result[1], Bytes::from_static(&[0x65, 0xaa, 0xbb]));
+
+    Ok(())
+}
+
+#[test]
+fn test_h264_payloader_annexb_p_frame() -> Result<()> {
+    // Non-IDR P-frame with AUD (no SPS/PPS)
+    let mut pck = H264Payloader::default();
+
+    let annexb_payload = Bytes::from_static(&[
+        // AUD (4-byte start code)
+        0x00, 0x00, 0x00, 0x01, 0x09, 0x30,
+        // P-slice (3-byte start code) - type 1
+        0x00, 0x00, 0x01, 0x41, 0xaa, 0xbb,
+    ]);
+
+    let result = pck.payload(1500, &annexb_payload)?;
+
+    // AUD stripped, P-slice emitted directly
+    assert_eq!(result.len(), 1, "Expected single P-slice");
+    assert_eq!(result[0], Bytes::from_static(&[0x41, 0xaa, 0xbb]));
+
+    Ok(())
+}

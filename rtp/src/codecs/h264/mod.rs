@@ -35,17 +35,19 @@ pub const OUTPUT_STAP_AHEADER: u8 = 0x78;
 pub static ANNEXB_NALUSTART_CODE: Bytes = Bytes::from_static(&[0x00, 0x00, 0x00, 0x01]);
 
 impl H264Payloader {
+    /// Find the next Annex B start code (supports both 3-byte and 4-byte).
+    /// Returns (start_position, start_code_length) or (-1, -1) if not found.
     fn next_ind(nalu: &Bytes, start: usize) -> (isize, isize) {
         let mut zero_count = 0;
 
         for (i, &b) in nalu[start..].iter().enumerate() {
             if b == 0 {
                 zero_count += 1;
-                continue;
             } else if b == 1 && zero_count >= 2 {
                 return ((start + i - zero_count) as isize, zero_count as isize + 1);
+            } else {
+                zero_count = 0;
             }
-            zero_count = 0
         }
         (-1, -1)
     }
@@ -58,16 +60,22 @@ impl H264Payloader {
         let nalu_type = nalu[0] & NALU_TYPE_BITMASK;
         let nalu_ref_idc = nalu[0] & NALU_REF_IDC_BITMASK;
 
+        // Strip Access Unit Delimiters and Filler
         if nalu_type == AUD_NALU_TYPE || nalu_type == FILLER_NALU_TYPE {
             return;
-        } else if nalu_type == SPS_NALU_TYPE {
-            self.sps_nalu = Some(nalu.clone());
+        }
+
+        // Collect SPS/PPS for aggregation — store and defer until a non-param NALU arrives
+        if nalu_type == SPS_NALU_TYPE {
+            self.sps_nalu.replace(nalu.clone());
             return;
         } else if nalu_type == PPS_NALU_TYPE {
-            self.pps_nalu = Some(nalu.clone());
+            self.pps_nalu.replace(nalu.clone());
             return;
-        } else if let (Some(sps_nalu), Some(pps_nalu)) = (&self.sps_nalu, &self.pps_nalu) {
-            // Pack current NALU with SPS and PPS as STAP-A
+        }
+
+        // When both parameter sets are collected, emit STAP-A before the current slice NALU
+        if let (Some(sps_nalu), Some(pps_nalu)) = (&self.sps_nalu, &self.pps_nalu) {
             let sps_len = (sps_nalu.len() as u16).to_be_bytes();
             let pps_len = (pps_nalu.len() as u16).to_be_bytes();
 
@@ -80,11 +88,8 @@ impl H264Payloader {
             if stap_a_nalu.len() <= mtu {
                 payloads.push(Bytes::from(stap_a_nalu));
             }
-        }
-
-        if self.sps_nalu.is_some() && self.pps_nalu.is_some() {
-            self.sps_nalu = None;
-            self.pps_nalu = None;
+            self.sps_nalu.take();
+            self.pps_nalu.take();
         }
 
         // Single NALU
@@ -93,23 +98,11 @@ impl H264Payloader {
             return;
         }
 
-        // FU-A
+        // FU-A - generic for ALL NAL types per RFC 6184
         let max_fragment_size = mtu as isize - FUA_HEADER_SIZE as isize;
 
-        // The FU payload consists of fragments of the payload of the fragmented
-        // NAL unit so that if the fragmentation unit payloads of consecutive
-        // FUs are sequentially concatenated, the payload of the fragmented NAL
-        // unit can be reconstructed.  The NAL unit type octet of the fragmented
-        // NAL unit is not included as such in the fragmentation unit payload,
-        // 	but rather the information of the NAL unit type octet of the
-        // fragmented NAL unit is conveyed in the F and NRI fields of the FU
-        // indicator octet of the fragmentation unit and in the type field of
-        // the FU header.  An FU payload MAY have any number of octets and MAY
-        // be empty.
-
-        let nalu_data = nalu;
         // According to the RFC, the first octet is skipped due to redundant information
-        let mut nalu_data_index = 1;
+        let mut nalu_data_index: isize = 1;
         let nalu_data_length = nalu.len() as isize - nalu_data_index;
         let mut nalu_data_remaining = nalu_data_length;
 
@@ -119,35 +112,26 @@ impl H264Payloader {
 
         while nalu_data_remaining > 0 {
             let current_fragment_size = std::cmp::min(max_fragment_size, nalu_data_remaining);
-            //out: = make([]byte, fuaHeaderSize + currentFragmentSize)
             let mut out = BytesMut::with_capacity(FUA_HEADER_SIZE + current_fragment_size as usize);
-            // +---------------+
-            // |0|1|2|3|4|5|6|7|
-            // +-+-+-+-+-+-+-+-+
-            // |F|NRI|  Type   |
-            // +---------------+
+
+            // FU indicator: F|NRI|Type(28)
             let b0 = FUA_NALU_TYPE | nalu_ref_idc;
             out.put_u8(b0);
 
-            // +---------------+
-            //|0|1|2|3|4|5|6|7|
-            //+-+-+-+-+-+-+-+-+
-            //|S|E|R|  Type   |
-            //+---------------+
-
-            let mut b1 = nalu_type;
-            if nalu_data_remaining == nalu_data_length {
-                // Set start bit
-                b1 |= 1 << 7;
-            } else if nalu_data_remaining - current_fragment_size == 0 {
-                // Set end bit
-                b1 |= 1 << 6;
-            }
-            out.put_u8(b1);
+            // FU header: S|E|R|Type
+            let is_first = nalu_data_index == 1;
+            let is_last = nalu_data_remaining == current_fragment_size && !is_first;
+            let fu_header = if is_first {
+                0x80 | nalu_type
+            } else if is_last {
+                0x40 | nalu_type
+            } else {
+                nalu_type
+            };
+            out.put_u8(fu_header);
 
             out.put(
-                &nalu_data
-                    [nalu_data_index as usize..(nalu_data_index + current_fragment_size) as usize],
+                &nalu[nalu_data_index as usize..(nalu_data_index + current_fragment_size) as usize],
             );
             payloads.push(out.freeze());
 
@@ -166,26 +150,30 @@ impl Payloader for H264Payloader {
 
         let mut payloads = vec![];
 
-        let (mut next_ind_start, mut next_ind_len) = H264Payloader::next_ind(payload, 0);
-        if next_ind_start == -1 {
+        // Find first start code
+        let (mut start, mut sc_len) = H264Payloader::next_ind(payload, 0);
+        if start < 0 {
+            // No start codes found, treat entire payload as single NALU
             self.emit(payload, mtu, &mut payloads);
-        } else {
-            while next_ind_start != -1 {
-                let prev_start = (next_ind_start + next_ind_len) as usize;
-                let (next_ind_start2, next_ind_len2) = H264Payloader::next_ind(payload, prev_start);
-                next_ind_start = next_ind_start2;
-                next_ind_len = next_ind_len2;
-                if next_ind_start != -1 {
-                    self.emit(
-                        &payload.slice(prev_start..next_ind_start as usize),
-                        mtu,
-                        &mut payloads,
-                    );
-                } else {
-                    // Emit until end of stream, no end indicator found
-                    self.emit(&payload.slice(prev_start..), mtu, &mut payloads);
-                }
+            return Ok(payloads);
+        }
+
+        loop {
+            let nalu_start = (start + sc_len) as usize;
+            let (next_start, next_sc_len) = H264Payloader::next_ind(payload, nalu_start);
+            if next_start < 0 {
+                // Last NALU
+                self.emit(&payload.slice(nalu_start..), mtu, &mut payloads);
+                break;
+            } else {
+                self.emit(
+                    &payload.slice(nalu_start..next_start as usize),
+                    mtu,
+                    &mut payloads,
+                );
             }
+            start = next_start;
+            sc_len = next_sc_len;
         }
 
         Ok(payloads)
