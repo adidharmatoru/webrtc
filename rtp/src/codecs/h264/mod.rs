@@ -74,7 +74,10 @@ impl H264Payloader {
             return;
         }
 
-        // When both parameter sets are collected, emit STAP-A before the current slice NALU
+        // When both parameter sets are collected, emit STAP-A before the current slice NALU.
+        // SPS/PPS are kept cached (not cleared) so STAP-A is emitted before every frame,
+        // not just IDR frames. This ensures decoders always have fresh parameter sets,
+        // which is required by some browsers (e.g. Chrome) for stable H264 WebRTC decoding.
         if let (Some(sps_nalu), Some(pps_nalu)) = (&self.sps_nalu, &self.pps_nalu) {
             let sps_len = (sps_nalu.len() as u16).to_be_bytes();
             let pps_len = (pps_nalu.len() as u16).to_be_bytes();
@@ -88,8 +91,6 @@ impl H264Payloader {
             if stap_a_nalu.len() <= mtu {
                 payloads.push(Bytes::from(stap_a_nalu));
             }
-            self.sps_nalu.take();
-            self.pps_nalu.take();
         }
 
         // Single NALU
