@@ -5,6 +5,7 @@ pub mod binding;
 pub mod periodic_timer;
 pub mod permission;
 pub mod relay_conn;
+pub mod tcp_conn;
 pub mod transaction;
 
 use std::net::SocketAddr;

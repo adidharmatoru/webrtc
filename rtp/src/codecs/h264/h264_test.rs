@@ -270,12 +270,9 @@ fn test_h264_payloader_mixed_annexb_start_codes() -> Result<()> {
     // AUD + SPS + PPS + IDR with mixed start codes (AMD AMF pattern)
     let annexb_payload = Bytes::from_static(&[
         // AUD (4-byte start code) - type 9
-        0x00, 0x00, 0x00, 0x01, 0x09, 0x10,
-        // SPS (3-byte start code) - type 7
-        0x00, 0x00, 0x01, 0x67, 0x42, 0xc0,
-        // PPS (3-byte start code) - type 8
-        0x00, 0x00, 0x01, 0x68, 0x1a, 0x34,
-        // IDR slice (3-byte start code) - type 5
+        0x00, 0x00, 0x00, 0x01, 0x09, 0x10, // SPS (3-byte start code) - type 7
+        0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, // PPS (3-byte start code) - type 8
+        0x00, 0x00, 0x01, 0x68, 0x1a, 0x34, // IDR slice (3-byte start code) - type 5
         0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb,
     ]);
 
@@ -304,8 +301,7 @@ fn test_h264_payloader_annexb_p_frame() -> Result<()> {
 
     let annexb_payload = Bytes::from_static(&[
         // AUD (4-byte start code)
-        0x00, 0x00, 0x00, 0x01, 0x09, 0x30,
-        // P-slice (3-byte start code) - type 1
+        0x00, 0x00, 0x00, 0x01, 0x09, 0x30, // P-slice (3-byte start code) - type 1
         0x00, 0x00, 0x01, 0x41, 0xaa, 0xbb,
     ]);
 

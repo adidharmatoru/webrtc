@@ -763,7 +763,6 @@ impl Agent {
                 return;
             }
 
-            let network = NetworkType::Udp4.to_string();
             let net2 = Arc::clone(&net);
             let agent_internal2 = Arc::clone(&agent_internal);
 
@@ -772,6 +771,11 @@ impl Agent {
                 let _d = w;
 
                 let turn_server_addr = format!("{}:{}", url.host, url.port);
+
+                // The relay candidate network is always UDP — the TURN server
+                // allocates a UDP relay address regardless of the client-to-TURN
+                // transport (UDP, TCP, or TLS).
+                let network = NetworkType::Udp4.to_string();
 
                 let (loc_conn, rel_addr, rel_port) =
                     if url.proto == ProtoType::Udp && url.scheme == SchemeType::Turn {
@@ -791,10 +795,58 @@ impl Agent {
                         let rel_addr = local_addr.ip().to_string();
                         let rel_port = local_addr.port();
                         (loc_conn, rel_addr, rel_port)
-                    /*TODO: case url.proto == ProtoType::UDP && url.scheme == SchemeType::TURNS{
-                    case a.proxyDialer != nil && url.Proto == ProtoTypeTCP && (url.Scheme == SchemeTypeTURN || url.Scheme == SchemeTypeTURNS):
-                    case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURN:
-                    case url.Proto == ProtoTypeTCP && url.Scheme == SchemeTypeTURNS:*/
+                    } else if url.proto == ProtoType::Tcp && url.scheme == SchemeType::Turn {
+                        // TURN over TCP (turn:host:port?transport=tcp)
+                        let resolved =
+                            net2.resolve_addr(true, &turn_server_addr)
+                                .await
+                                .map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                                })?;
+
+                        let loc_conn: Arc<dyn util::Conn + Send + Sync> =
+                            match turn::client::tcp_conn::TcpConn::connect(resolved).await {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    log::warn!(
+                                        "[{}]: Failed to connect TCP to TURN server {}: {}",
+                                        agent_internal2.get_name(),
+                                        turn_server_addr,
+                                        err
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                        let local_addr = loc_conn.local_addr()?;
+                        (loc_conn, local_addr.ip().to_string(), local_addr.port())
+                    } else if url.proto == ProtoType::Tcp && url.scheme == SchemeType::Turns {
+                        // TURNS over TLS (turns:host:443?transport=tcp)
+                        let resolved =
+                            net2.resolve_addr(true, &turn_server_addr)
+                                .await
+                                .map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                                })?;
+
+                        let loc_conn: Arc<dyn util::Conn + Send + Sync> =
+                            match turn::client::tcp_conn::TcpConn::connect_tls(resolved, &url.host)
+                                .await
+                            {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    log::warn!(
+                                        "[{}]: Failed to connect TLS to TURNS server {}: {}",
+                                        agent_internal2.get_name(),
+                                        turn_server_addr,
+                                        err
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                        let local_addr = loc_conn.local_addr()?;
+                        (loc_conn, local_addr.ip().to_string(), local_addr.port())
                     } else {
                         log::warn!(
                             "[{}]: Unable to handle URL in gather_candidates_relay {}",
