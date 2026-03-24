@@ -11,10 +11,12 @@ pub const H265FRAGMENTATION_UNIT_HEADER_SIZE: usize = 1;
 pub const NAL_HEADER_SIZE: usize = 2;
 
 /// HEVC NAL unit types (ITU-T H.265 Table 7-1)
-const NAL_TYPE_VPS: u8 = 32;
-const NAL_TYPE_SPS: u8 = 33;
-const NAL_TYPE_PPS: u8 = 34;
-const NAL_TYPE_AUD: u8 = 35;
+pub const NAL_TYPE_VPS: u8 = 32;
+pub const NAL_TYPE_SPS: u8 = 33;
+pub const NAL_TYPE_PPS: u8 = 34;
+pub const NAL_TYPE_AUD: u8 = 35;
+pub const NAL_TYPE_SEI_PREFIX: u8 = 39;
+pub const NAL_TYPE_SEI_SUFFIX: u8 = 40;
 /// RTP packetization types (RFC 7798)
 const NAL_TYPE_AP: u8 = 48;
 const NAL_TYPE_FU: u8 = 49;

@@ -21,7 +21,10 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp::codecs::h264::ANNEXB_NALUSTART_CODE;
-use webrtc::rtp::codecs::h265::{H265NALUHeader, H265Packet, H265Payload, UnitType};
+use webrtc::rtp::codecs::h265::{
+    H265NALUHeader, H265Packet, H265Payload, NAL_TYPE_PPS, NAL_TYPE_SEI_PREFIX,
+    NAL_TYPE_SEI_SUFFIX, NAL_TYPE_SPS, NAL_TYPE_VPS,
+};
 use webrtc::rtp::packetizer::Depacketizer;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
@@ -230,18 +233,18 @@ async fn main() -> Result<()> {
                                             H265Payload::H265AggregationPacket(p) => {
                                                 if let Some(uf) = p.first_unit() {
                                                     println!(
-                                                        "[Listener] aggr first nal len {} type {:?}",
+                                                        "[Listener] aggr first nal len {} type {}",
                                                         uf.nal_unit().len(),
-                                                        UnitType::for_id((uf.nal_unit()[0] & 0b0111_1110) >> 1)
+                                                        (uf.nal_unit()[0] & 0b0111_1110) >> 1
                                                     );
                                                     fdata.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                                                     fdata.extend_from_slice(&uf.nal_unit());
                                                 }
                                                 for ou in p.other_units() {
                                                     println!(
-                                                        "[Listener] aggr other nal len {} type {:?}",
+                                                        "[Listener] aggr other nal len {} type {}",
                                                         ou.nal_unit().len(),
-                                                        UnitType::for_id((ou.nal_unit()[0] & 0b0111_1110) >> 1)
+                                                        (ou.nal_unit()[0] & 0b0111_1110) >> 1
                                                     );
                                                     fdata.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                                                     fdata.extend_from_slice(&ou.nal_unit());
@@ -434,8 +437,7 @@ async fn offer_worker(
             }
             let nal_data = data_list.remove(0);
             let payload_header = H265NALUHeader::new(nal_data[4], nal_data[5]);
-            let payload_nalu_type = payload_header.nalu_type();
-            let nalu_type = UnitType::for_id(payload_nalu_type).unwrap_or(UnitType::IGNORE);
+            let nalu_type = payload_header.nalu_type();
             if let Err(e) = local_video_track
                 .write_sample(&Sample {
                     data: nal_data.freeze(),
@@ -447,10 +449,12 @@ async fn offer_worker(
                 println!("[Speaker] sending video err {e}");
             }
 
-            if nalu_type != UnitType::VPS
-                || nalu_type != UnitType::SPS
-                || nalu_type != UnitType::PPS
-                || nalu_type != UnitType::SEI
+            // Don't pace parameter sets and SEI — send them immediately
+            if nalu_type != NAL_TYPE_VPS
+                && nalu_type != NAL_TYPE_SPS
+                && nalu_type != NAL_TYPE_PPS
+                && nalu_type != NAL_TYPE_SEI_PREFIX
+                && nalu_type != NAL_TYPE_SEI_SUFFIX
             {
                 let _ = ticker.tick().await;
             }
