@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use socket2::SockAddr;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use util::ifaces;
 
 use crate::config::*;
@@ -37,6 +37,19 @@ pub struct DnsConn {
 
     is_server_closed: Arc<atomic::AtomicBool>,
     close_server: mpsc::Sender<()>,
+
+    /// Broadcast that fires when the conn is closed (or dropped) so that
+    /// every in-flight `query()` future wakes promptly and releases its
+    /// `Arc<DnsConn>`.
+    ///
+    /// Without this, an `query()` for a remote candidate whose owner never
+    /// answers (the common case, most browsers do not respond to mDNS
+    /// resolution for their own ICE candidates) loops forever on
+    /// `query_interval` ticks. Each stuck query keeps `Arc<DnsConn>`
+    /// alive, which keeps the multicast UDP socket bound. Across peer
+    /// reconnects this leaks a port per session and exhausts the
+    /// ephemeral pool, forcing all subsequent connections through TURN.
+    close_broadcast: broadcast::Sender<()>,
 }
 
 struct Query {
@@ -107,6 +120,7 @@ impl DnsConn {
         let is_server_closed = Arc::new(atomic::AtomicBool::new(false));
 
         let (close_server_send, close_server_rcv) = mpsc::channel(1);
+        let (close_broadcast, _) = broadcast::channel::<()>(1);
 
         let c = DnsConn {
             query_interval: if config.query_interval != Duration::from_secs(0) {
@@ -120,6 +134,7 @@ impl DnsConn {
             dst_addr,
             is_server_closed: Arc::clone(&is_server_closed),
             close_server: close_server_send,
+            close_broadcast,
         };
 
         let queries = c.queries.clone();
@@ -147,6 +162,15 @@ impl DnsConn {
             return Err(Error::ErrConnectionClosed);
         }
 
+        // Set the flag *before* signalling so any new `query()` calls
+        // returning to the loop top observe the closed state immediately.
+        self.is_server_closed.store(true, atomic::Ordering::SeqCst);
+
+        // Wake every in-flight `query()` future so they release their
+        // `Arc<DnsConn>` references. `send` returns Err if no receivers
+        // are subscribed, which is fine, nothing to wake.
+        let _ = self.close_broadcast.send(());
+
         log::trace!("Sending close command to server");
         match self.close_server.send(()).await {
             Ok(_) => {
@@ -171,6 +195,12 @@ impl DnsConn {
             return Err(Error::ErrConnectionClosed);
         }
 
+        // Subscribe to the conn-level close broadcast so this query
+        // exits promptly when `DnsConn::close()` is called or the conn
+        // is dropped (sender drops → `recv()` returns `Err(Closed)`,
+        // which the select treats as the close branch firing).
+        let mut conn_closed = self.close_broadcast.subscribe();
+
         let name_with_suffix = name.to_owned() + ".";
 
         let (query_tx, mut query_rx) = mpsc::channel(1);
@@ -194,6 +224,11 @@ impl DnsConn {
 
                 _ = close_query_signal.recv() => {
                     log::info!("Query close signal received.");
+                    return Err(Error::ErrConnectionClosed)
+                },
+
+                _ = conn_closed.recv() => {
+                    log::info!("Conn closed; query exiting.");
                     return Err(Error::ErrConnectionClosed)
                 },
 
