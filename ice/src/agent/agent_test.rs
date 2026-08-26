@@ -2201,3 +2201,59 @@ async fn test_lite_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_find_remote_candidate_is_keyed_on_the_remote_family() -> Result<()> {
+    let a = Agent::new(AgentConfig::default()).await?;
+
+    let remote_config = CandidateHostConfig {
+        base_config: CandidateBaseConfig {
+            network: "udp".to_owned(),
+            address: "192.168.1.50".to_owned(),
+            port: 7000,
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let remote: Arc<dyn Candidate + Send + Sync> = Arc::new(remote_config.new_candidate_host()?);
+    assert_eq!(
+        remote.network_type(),
+        NetworkType::Udp4,
+        "an IPv4 remote is filed under Udp4"
+    );
+    a.internal.add_remote_candidate(&remote).await;
+
+    let addr: SocketAddr = "192.168.1.50:7000".parse().unwrap();
+
+    // Same family: found before and after the fix.
+    assert!(
+        a.internal
+            .find_remote_candidate(NetworkType::Udp4, addr)
+            .await
+            .is_some(),
+        "a matching-family lookup must keep working"
+    );
+
+    // Mismatched family: this is the case a muxed socket creates constantly.
+    assert!(
+        a.internal
+            .find_remote_candidate(NetworkType::Udp6, addr)
+            .await
+            .is_some(),
+        "an IPv6 local candidate reading an IPv4 packet must still find the remote; keying the \
+         bucket on the local family is what silently discarded muxed input"
+    );
+
+    // The transport half still belongs to the local candidate: a TCP local must not reach a
+    // UDP remote.
+    assert!(
+        a.internal
+            .find_remote_candidate(NetworkType::Tcp4, addr)
+            .await
+            .is_none(),
+        "transport must not be laundered; a TCP local candidate has no business finding a UDP remote"
+    );
+
+    Ok(())
+}

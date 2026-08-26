@@ -93,3 +93,45 @@ fn test_network_type_to_string() {
         assert_eq!(network_type.to_string(), expected_string);
     }
 }
+
+#[test]
+fn test_remote_network_type_keys_on_the_remote_family() {
+    use std::net::IpAddr;
+
+    let v4: IpAddr = "192.168.1.5".parse().unwrap();
+    let v6: IpAddr = "2001:db8::1".parse().unwrap();
+
+    // The transport half follows the local candidate; the family half follows the packet.
+    assert_eq!(
+        remote_network_type(NetworkType::Udp6, &v4),
+        NetworkType::Udp4,
+        "a v6 local candidate reading a v4 packet must look in the v4 bucket"
+    );
+    assert_eq!(
+        remote_network_type(NetworkType::Udp4, &v6),
+        NetworkType::Udp6
+    );
+    assert_eq!(
+        remote_network_type(NetworkType::Tcp6, &v4),
+        NetworkType::Tcp4,
+        "transport must not be laundered into UDP"
+    );
+    assert_eq!(
+        remote_network_type(NetworkType::Tcp4, &v6),
+        NetworkType::Tcp6
+    );
+    assert_eq!(
+        remote_network_type(NetworkType::Unspecified, &v4),
+        NetworkType::Unspecified
+    );
+
+    // Same-family is unchanged.
+    assert_eq!(
+        remote_network_type(NetworkType::Udp4, &v4),
+        NetworkType::Udp4
+    );
+    assert_eq!(
+        remote_network_type(NetworkType::Udp6, &v6),
+        NetworkType::Udp6
+    );
+}

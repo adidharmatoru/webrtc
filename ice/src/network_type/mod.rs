@@ -141,3 +141,25 @@ pub(crate) fn determine_network_type(network: &str, ip: &IpAddr) -> Result<Netwo
         Err(Error::ErrDetermineNetworkType)
     }
 }
+
+/// The bucket a remote candidate at `remote` lives in, given the local candidate's type.
+pub(crate) fn remote_network_type(local: NetworkType, remote: &IpAddr) -> NetworkType {
+    let ipv4 = remote.is_ipv4();
+    match local {
+        NetworkType::Udp4 | NetworkType::Udp6 => {
+            if ipv4 {
+                NetworkType::Udp4
+            } else {
+                NetworkType::Udp6
+            }
+        }
+        NetworkType::Tcp4 | NetworkType::Tcp6 => {
+            if ipv4 {
+                NetworkType::Tcp4
+            } else {
+                NetworkType::Tcp6
+            }
+        }
+        NetworkType::Unspecified => NetworkType::Unspecified,
+    }
+}

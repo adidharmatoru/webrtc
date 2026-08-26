@@ -411,7 +411,7 @@ impl Agent {
         )
         .await;
 
-        let candidate_ips: Vec<std::net::IpAddr> = ext_ip_mapper
+        let mut candidate_ips: Vec<std::net::IpAddr> = ext_ip_mapper
             .as_ref() // Arc
             .as_ref() // Option
             .and_then(|mapper| {
@@ -435,6 +435,9 @@ impl Agent {
                 )
             })
             .unwrap_or_else(|| local_ips.iter().copied().collect());
+
+        candidate_ips.sort_unstable();
+        candidate_ips.dedup();
 
         if candidate_ips.is_empty() {
             return Err(Error::ErrCandidateIpNotFound);

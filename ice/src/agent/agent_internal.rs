@@ -691,6 +691,7 @@ impl AgentInternal {
         addr: SocketAddr,
     ) -> Option<Arc<dyn Candidate + Send + Sync>> {
         let (ip, port) = (addr.ip(), addr.port());
+        let network_type = crate::network_type::remote_network_type(network_type, &ip);
 
         let remote_candidates = self.remote_candidates.lock().await;
         if let Some(cands) = remote_candidates.get(&network_type) {

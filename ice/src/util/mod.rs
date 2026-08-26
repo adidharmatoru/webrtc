@@ -125,6 +125,7 @@ pub async fn local_interfaces(
             let ipaddr = ipnet.addr();
 
             if (!ipaddr.is_loopback() || include_loopback)
+                && !is_unusable_link_local_v6(&ipaddr)
                 && ((ipv4requested && ipaddr.is_ipv4()) || (ipv6requested && ipaddr.is_ipv6()))
                 && ip_filter
                     .as_ref()
@@ -205,5 +206,17 @@ mod tests {
                 .await,
             Err(crate::Error::ErrPort)
         ))
+    }
+}
+
+/// Whether `ip` is an IPv6 link-local address, which cannot be used as an ICE candidate.
+///
+/// The candidate representation is a bare address string with no zone index, and the scope_id
+/// the address was enumerated with is dropped by the time it reaches here, so nothing can send
+/// to it. Gathering one only adds a pair that stalls until it times out.
+fn is_unusable_link_local_v6(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        IpAddr::V4(_) => false,
     }
 }

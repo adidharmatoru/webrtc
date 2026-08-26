@@ -264,7 +264,7 @@ unsafe fn v6_socket_from_adapter(unicast_addr: &IpAdapterUnicastAddress) -> Sock
     let sock_addr6: *const SOCKADDR_IN6 = socket_addr.lpSockaddr as *const SOCKADDR_IN6;
     let in6_addr: SOCKADDR_IN6 = *sock_addr6;
 
-    let v6_addr = (*in6_addr.sin6_addr.u.Word()).into();
+    let v6_addr = std::net::Ipv6Addr::from(*in6_addr.sin6_addr.u.Byte());
 
     SocketAddrV6::new(
         v6_addr,
