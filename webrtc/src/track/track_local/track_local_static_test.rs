@@ -432,3 +432,78 @@ async fn test_track_local_static_binding_non_blocking() -> Result<()> {
     }
 }
 */
+
+#[derive(Debug, Default)]
+struct PayloadSizes(std::sync::Mutex<Vec<usize>>);
+
+#[async_trait]
+impl TrackLocalWriter for PayloadSizes {
+    async fn write_rtp_with_attributes(
+        &self,
+        pkt: &rtp::packet::Packet,
+        _attr: &Attributes,
+    ) -> Result<usize> {
+        let n = pkt.payload.len();
+        self.0.lock().unwrap().push(n);
+        Ok(n)
+    }
+}
+
+async fn vp8_payload_sizes(options: SampleTrackOptions) -> Result<Vec<usize>> {
+    let sizes = Arc::new(PayloadSizes::default());
+    let capability = RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_VP8.to_owned(),
+        clock_rate: 90000,
+        ..Default::default()
+    };
+    let track = TrackLocalStaticSample::new(
+        capability.clone(),
+        "video".to_owned(),
+        "webrtc-rs".to_owned(),
+    )
+    .with_options(options);
+
+    track
+        .bind(&TrackLocalContext {
+            id: "0".to_owned(),
+            params: RTCRtpParameters {
+                header_extensions: vec![],
+                codecs: vec![RTCRtpCodecParameters {
+                    capability,
+                    payload_type: 96,
+                    ..Default::default()
+                }],
+            },
+            ssrc: 0,
+            write_stream: Arc::clone(&sizes) as Arc<dyn TrackLocalWriter + Send + Sync>,
+            paused: Arc::new(AtomicBool::new(false)),
+            mid: None,
+        })
+        .await?;
+
+    track
+        .write_sample(&media::Sample {
+            data: Bytes::from(vec![0u8; 8192]),
+            duration: std::time::Duration::from_millis(33),
+            ..Default::default()
+        })
+        .await?;
+
+    let sizes = sizes.0.lock().unwrap().clone();
+    Ok(sizes)
+}
+
+// A SampleTrackOptions outbound_mtu must reach the packetizer, so a smaller one has to split the
+// same sample into more, smaller RTP payloads
+#[tokio::test]
+async fn test_track_local_static_sample_honours_outbound_mtu() -> Result<()> {
+    let default_sizes = vp8_payload_sizes(SampleTrackOptions::default()).await?;
+    let small_sizes = vp8_payload_sizes(SampleTrackOptions { outbound_mtu: 400 }).await?;
+
+    assert!(!default_sizes.is_empty() && !small_sizes.is_empty());
+    assert!(default_sizes.iter().copied().max().unwrap() > 400);
+    assert!(small_sizes.iter().copied().max().unwrap() <= 400);
+    assert!(small_sizes.len() > default_sizes.len());
+
+    Ok(())
+}

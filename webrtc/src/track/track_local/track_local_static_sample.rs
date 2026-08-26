@@ -15,12 +15,53 @@ struct TrackLocalStaticSampleInternal {
     did_warn_about_wonky_pause: bool,
 }
 
+/// Optional settings for a [`TrackLocalStaticSample`], applied with
+/// [`TrackLocalStaticSample::with_options`].
+///
+/// Every field has a default, so a field added later costs existing callers nothing:
+///
+/// ```
+/// use webrtc::api::media_engine::MIME_TYPE_VP8;
+/// use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+/// use webrtc::track::track_local::track_local_static_sample::{
+///     SampleTrackOptions, TrackLocalStaticSample,
+/// };
+///
+/// let track = TrackLocalStaticSample::new(
+///     RTCRtpCodecCapability {
+///         mime_type: MIME_TYPE_VP8.to_owned(),
+///         ..Default::default()
+///     },
+///     "video".to_owned(),
+///     "webrtc-rs".to_owned(),
+/// )
+/// .with_options(SampleTrackOptions { outbound_mtu: 1200 });
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleTrackOptions {
+    /// Payload size in bytes the packetizer splits each sample into.
+    ///
+    /// Defaults to [`RTP_OUTBOUND_MTU`], which is deliberately conservative: a packet larger than
+    /// the path MTU is IP-fragmented, and losing any one fragment loses the whole datagram, so
+    /// raising this past what the path actually carries makes delivery worse, not better.
+    pub outbound_mtu: usize,
+}
+
+impl Default for SampleTrackOptions {
+    fn default() -> Self {
+        Self {
+            outbound_mtu: RTP_OUTBOUND_MTU,
+        }
+    }
+}
+
 /// TrackLocalStaticSample is a TrackLocal that has a pre-set codec and accepts Samples.
 /// If you wish to send a RTP Packet use TrackLocalStaticRTP
 #[derive(Debug)]
 pub struct TrackLocalStaticSample {
     rtp_track: TrackLocalStaticRTP,
     internal: Mutex<TrackLocalStaticSampleInternal>,
+    outbound_mtu: usize,
 }
 
 impl TrackLocalStaticSample {
@@ -30,6 +71,7 @@ impl TrackLocalStaticSample {
 
         TrackLocalStaticSample {
             rtp_track,
+            outbound_mtu: RTP_OUTBOUND_MTU,
             internal: Mutex::new(TrackLocalStaticSampleInternal {
                 packetizer: None,
                 sequencer: None,
@@ -37,6 +79,14 @@ impl TrackLocalStaticSample {
                 did_warn_about_wonky_pause: false,
             }),
         }
+    }
+
+    /// applies [`SampleTrackOptions`] to a track, replacing whatever the constructor defaulted to
+    ///
+    /// Only takes effect before the track is bound, since binding is what builds the packetizer.
+    pub fn with_options(mut self, options: SampleTrackOptions) -> Self {
+        self.outbound_mtu = options.outbound_mtu;
+        self
     }
 
     /// returns a TrackLocalStaticSample with RID
@@ -50,6 +100,7 @@ impl TrackLocalStaticSample {
 
         TrackLocalStaticSample {
             rtp_track,
+            outbound_mtu: RTP_OUTBOUND_MTU,
             internal: Mutex::new(TrackLocalStaticSampleInternal {
                 packetizer: None,
                 sequencer: None,
@@ -215,7 +266,7 @@ impl TrackLocal for TrackLocalStaticSample {
         let sequencer: Box<dyn rtp::sequence::Sequencer + Send + Sync> =
             Box::new(rtp::sequence::new_random_sequencer());
         internal.packetizer = Some(Box::new(rtp::packetizer::new_packetizer(
-            RTP_OUTBOUND_MTU,
+            self.outbound_mtu,
             0, // Value is handled when writing
             0, // Value is handled when writing
             payloader,
