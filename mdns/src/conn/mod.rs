@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use socket2::SockAddr;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use util::ifaces;
 
 use crate::config::*;
@@ -29,27 +29,16 @@ const RESPONSE_TTL: u32 = 120;
 
 // Conn represents a mDNS Server
 pub struct DnsConn {
-    socket: Arc<UdpSocket>,
+    socket: Mutex<Option<Arc<UdpSocket>>>,
+    server_task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     dst_addr: SocketAddr,
 
     query_interval: Duration,
     queries: Arc<Mutex<Vec<Query>>>,
 
     is_server_closed: Arc<atomic::AtomicBool>,
+    closed: watch::Sender<bool>,
     close_server: mpsc::Sender<()>,
-
-    /// Broadcast that fires when the conn is closed (or dropped) so that
-    /// every in-flight `query()` future wakes promptly and releases its
-    /// `Arc<DnsConn>`.
-    ///
-    /// Without this, an `query()` for a remote candidate whose owner never
-    /// answers (the common case, most browsers do not respond to mDNS
-    /// resolution for their own ICE candidates) loops forever on
-    /// `query_interval` ticks. Each stuck query keeps `Arc<DnsConn>`
-    /// alive, which keeps the multicast UDP socket bound. Across peer
-    /// reconnects this leaks a port per session and exhausts the
-    /// ephemeral pool, forcing all subsequent connections through TURN.
-    close_broadcast: broadcast::Sender<()>,
 }
 
 struct Query {
@@ -63,6 +52,12 @@ struct QueryResult {
 }
 
 impl DnsConn {
+    #[cfg(test)]
+    async fn socket_weak_for_test(&self) -> std::sync::Weak<UdpSocket> {
+        let socket = self.socket.lock().await;
+        Arc::downgrade(socket.as_ref().expect("mDNS socket is open"))
+    }
+
     /// server establishes a mDNS connection over an existing connection
     pub fn server(addr: SocketAddr, config: Config) -> Result<Self> {
         let socket = socket2::Socket::new(
@@ -120,68 +115,72 @@ impl DnsConn {
         let is_server_closed = Arc::new(atomic::AtomicBool::new(false));
 
         let (close_server_send, close_server_rcv) = mpsc::channel(1);
-        let (close_broadcast, _) = broadcast::channel::<()>(1);
+        let (closed, _) = watch::channel(false);
 
-        let c = DnsConn {
+        let queries = Arc::new(Mutex::new(vec![]));
+        let socket = Arc::new(socket);
+        let server_task = tokio::spawn({
+            let is_server_closed = Arc::clone(&is_server_closed);
+            let queries = Arc::clone(&queries);
+            let socket = Arc::clone(&socket);
+
+            async move {
+                DnsConn::start(
+                    close_server_rcv,
+                    is_server_closed,
+                    socket,
+                    local_names,
+                    dst_addr,
+                    queries,
+                )
+                .await
+            }
+        });
+
+        Ok(DnsConn {
             query_interval: if config.query_interval != Duration::from_secs(0) {
                 config.query_interval
             } else {
                 DEFAULT_QUERY_INTERVAL
             },
-
-            queries: Arc::new(Mutex::new(vec![])),
-            socket: Arc::new(socket),
+            queries,
+            socket: Mutex::new(Some(socket)),
+            server_task: Mutex::new(Some(server_task)),
             dst_addr,
-            is_server_closed: Arc::clone(&is_server_closed),
+            is_server_closed,
+            closed,
             close_server: close_server_send,
-            close_broadcast,
-        };
-
-        let queries = c.queries.clone();
-        let socket = Arc::clone(&c.socket);
-
-        tokio::spawn(async move {
-            DnsConn::start(
-                close_server_rcv,
-                is_server_closed,
-                socket,
-                local_names,
-                dst_addr,
-                queries,
-            )
-            .await
-        });
-
-        Ok(c)
+        })
     }
 
     /// Close closes the mDNS Conn
     pub async fn close(&self) -> Result<()> {
         log::info!("Closing connection");
-        if self.is_server_closed.load(atomic::Ordering::SeqCst) {
+        if self.is_server_closed.swap(true, atomic::Ordering::SeqCst) {
+            return Err(Error::ErrConnectionClosed);
+        }
+        self.closed.send_replace(true);
+
+        log::trace!("Sending close command to server");
+        let close_sent = self.close_server.send(()).await;
+        let server_task = self.server_task.lock().await.take();
+        let server_result = match server_task {
+            Some(server_task) => match server_task.await {
+                Ok(result) => result,
+                Err(err) => Err(Error::Other(format!("mDNS server task failed: {err}"))),
+            },
+            None => Ok(()),
+        };
+
+        self.socket.lock().await.take();
+
+        if let Err(err) = close_sent {
+            log::warn!("Error sending close command to server: {err:?}");
             return Err(Error::ErrConnectionClosed);
         }
 
-        // Set the flag *before* signalling so any new `query()` calls
-        // returning to the loop top observe the closed state immediately.
-        self.is_server_closed.store(true, atomic::Ordering::SeqCst);
-
-        // Wake every in-flight `query()` future so they release their
-        // `Arc<DnsConn>` references. `send` returns Err if no receivers
-        // are subscribed, which is fine, nothing to wake.
-        let _ = self.close_broadcast.send(());
-
-        log::trace!("Sending close command to server");
-        match self.close_server.send(()).await {
-            Ok(_) => {
-                log::trace!("Close command sent");
-                Ok(())
-            }
-            Err(e) => {
-                log::warn!("Error sending close command to server: {e:?}");
-                Err(Error::ErrConnectionClosed)
-            }
-        }
+        log::trace!("Close command sent and server task stopped");
+        server_result
     }
 
     /// Query sends mDNS Queries for the following name until
@@ -191,15 +190,10 @@ impl DnsConn {
         name: &str,
         mut close_query_signal: mpsc::Receiver<()>,
     ) -> Result<(ResourceHeader, SocketAddr)> {
-        if self.is_server_closed.load(atomic::Ordering::SeqCst) {
+        let mut closed = self.closed.subscribe();
+        if *closed.borrow() {
             return Err(Error::ErrConnectionClosed);
         }
-
-        // Subscribe to the conn-level close broadcast so this query
-        // exits promptly when `DnsConn::close()` is called or the conn
-        // is dropped (sender drops → `recv()` returns `Err(Closed)`,
-        // which the select treats as the close branch firing).
-        let mut conn_closed = self.close_broadcast.subscribe();
 
         let name_with_suffix = name.to_owned() + ".";
 
@@ -227,8 +221,8 @@ impl DnsConn {
                     return Err(Error::ErrConnectionClosed)
                 },
 
-                _ = conn_closed.recv() => {
-                    log::info!("Conn closed; query exiting.");
+                _ = closed.changed() => {
+                    log::info!("Connection close signal received by query.");
                     return Err(Error::ErrConnectionClosed)
                 },
 
@@ -243,6 +237,12 @@ impl DnsConn {
     }
 
     async fn send_question(&self, name: &str) {
+        let socket = self.socket.lock().await.clone();
+        let Some(socket) = socket else {
+            log::warn!("Cannot send mDNS question on a closed connection");
+            return;
+        };
+
         let packed_name = match Name::new(name) {
             Ok(pn) => pn,
             Err(err) => {
@@ -271,8 +271,8 @@ impl DnsConn {
             }
         };
 
-        log::trace!("{:?} sending {:?}...", self.socket.local_addr(), raw_query);
-        if let Err(err) = self.socket.send_to(&raw_query, self.dst_addr).await {
+        log::trace!("{:?} sending {:?}...", socket.local_addr(), raw_query);
+        if let Err(err) = socket.send_to(&raw_query, self.dst_addr).await {
             log::error!("Failed to send mDNS packet {err}");
         }
     }
@@ -361,7 +361,7 @@ async fn run(
                         Err(e) => {
                             log::warn!(
                                 "Failed to get local interface to communicate with {}: {:?}",
-                                &src,
+                                src,
                                 e
                             );
                             continue;

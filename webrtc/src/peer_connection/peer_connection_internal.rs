@@ -86,7 +86,7 @@ impl PeerConnectionInternal {
         let ice_transport = Arc::new(api.new_ice_transport(Arc::clone(&ice_gatherer)));
 
         // Create the DTLS transport
-        let certificates = configuration.certificates.drain(..).collect();
+        let certificates = std::mem::take(&mut configuration.certificates);
         let dtls_transport =
             Arc::new(api.new_dtls_transport(Arc::clone(&ice_transport), certificates)?);
 
@@ -834,6 +834,7 @@ impl PeerConnectionInternal {
             connection_role: DEFAULT_DTLS_ROLE_OFFER.to_connection_role(),
             ice_gathering_state: self.ice_gathering_state(),
             match_bundle_group: None,
+            sctp_max_message_size: self.setting_engine.get_sctp_max_message_size_can_receive(),
         };
         populate_sdp(
             d,
@@ -967,6 +968,7 @@ impl PeerConnectionInternal {
             connection_role,
             ice_gathering_state: self.ice_gathering_state(),
             match_bundle_group,
+            sctp_max_message_size: self.setting_engine.get_sctp_max_message_size_can_receive(),
         };
         populate_sdp(
             d,
