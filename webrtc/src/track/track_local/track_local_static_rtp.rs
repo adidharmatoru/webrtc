@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use util::{Marshal, MarshalSize};
 
 use super::*;
 use crate::error::flatten_errs;
+
+/// How many packets a binding may have waiting for its transport before new ones are dropped
+/// for it alone: a large keyframe and a few frames after it.
+pub const BINDING_OUTBOX_PACKETS: usize = 512;
 
 /// TrackLocalStaticRTP  is a TrackLocal that has a pre-set codec and accepts RTP Packets.
 /// If you wish to send a media.Sample use TrackLocalStaticSample
@@ -70,6 +74,10 @@ impl TrackLocalStaticRTP {
     /// all PeerConnections. The error message will contain the ID of the failed
     /// PeerConnections so you can remove them
     ///
+    /// Each binding sends from its own queue of [`BINDING_OUTBOX_PACKETS`], so this returns
+    /// once the packet is queued for every binding: a binding whose transport cannot keep up
+    /// drops its own packets (its receiver asks for a keyframe) and delays no other.
+    ///
     /// If the RTCRtpSender direction is such that no packets should be sent, any call to this
     /// function are blocked internally. Care must be taken to not increase the sequence number
     /// while the sender is paused. While the actual _sending_ is blocked, the receiver will
@@ -95,12 +103,7 @@ impl TrackLocalStaticRTP {
     ) -> Result<usize> {
         let mut n = 0;
         let mut write_errs = vec![];
-        let mut pkt = p.clone();
 
-        let bindings = {
-            let bindings = self.bindings.lock().await;
-            bindings.clone()
-        };
         // Prepare the extensions data
         let extension_data: HashMap<_, _> = extensions
             .iter()
@@ -120,11 +123,13 @@ impl TrackLocalStaticRTP {
             })
             .collect();
 
-        for b in bindings.into_iter() {
+        let bindings = self.bindings.lock().await;
+        for b in bindings.iter() {
             if b.is_sender_paused() {
                 // See caveat in function doc.
                 continue;
             }
+            let mut pkt = p.clone();
             pkt.header.ssrc = b.ssrc;
             pkt.header.payload_type = b.payload_type;
 
@@ -150,15 +155,17 @@ impl TrackLocalStaticRTP {
                 }
             }
 
-            match b.write_stream.write_rtp_with_attributes(&pkt, attr).await {
-                Ok(m) => {
-                    n += m;
-                }
-                Err(err) => {
-                    write_errs.push(err);
+            let size = pkt.marshal_size();
+            match b.outbox.try_send((pkt, attr.clone())) {
+                Ok(()) => n += size,
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    write_errs.push(Error::ErrClosedPipe);
                 }
             }
         }
+
+        drop(bindings);
 
         flatten_errs(write_errs)?;
         Ok(n)
@@ -204,6 +211,14 @@ impl TrackLocal for TrackLocalStaticRTP {
 
         let (codec, match_type) = codec_parameters_fuzzy_search(&parameters, t.codec_parameters());
         if match_type != CodecMatch::None {
+            let (outbox, mut queued) =
+                mpsc::channel::<(rtp::packet::Packet, Attributes)>(BINDING_OUTBOX_PACKETS);
+            let write_stream = t.write_stream();
+            tokio::spawn(async move {
+                while let Some((pkt, attr)) = queued.recv().await {
+                    let _ = write_stream.write_rtp_with_attributes(&pkt, &attr).await;
+                }
+            });
             {
                 let mut bindings = self.bindings.lock().await;
                 bindings.push(Arc::new(TrackBinding {
@@ -211,9 +226,9 @@ impl TrackLocal for TrackLocalStaticRTP {
                     ssrc: t.ssrc(),
                     payload_type: codec.payload_type,
                     params: t.params.clone(),
-                    write_stream: t.write_stream(),
                     sender_paused: t.paused.clone(),
                     hdr_ext_ids,
+                    outbox,
                 }));
             }
 

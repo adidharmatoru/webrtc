@@ -313,3 +313,47 @@ fn test_h264_payloader_annexb_p_frame() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_h264_payloader_parameter_sets_ride_only_idr_access_units() -> Result<()> {
+    let mut pck = H264Payloader::default();
+    let idr_with_parameter_sets = Bytes::from_static(&[
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, // SPS
+        0x00, 0x00, 0x01, 0x68, 0x1a, 0x34, // PPS
+        0x00, 0x00, 0x01, 0x06, 0x05, 0x01, // SEI
+        0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb, // IDR slice
+        0x00, 0x00, 0x01, 0x65, 0xcc, 0xdd, // second IDR slice
+    ]);
+    let first = pck.payload(1500, &idr_with_parameter_sets)?;
+    assert_eq!(first.len(), 4, "STAP-A, SEI and two slices: {first:?}");
+    assert_eq!(first[0][0] & NALU_TYPE_BITMASK, STAPA_NALU_TYPE);
+    assert_eq!(first[1], Bytes::from_static(&[0x06, 0x05, 0x01]));
+    assert_eq!(
+        first
+            .iter()
+            .filter(|p| p[0] & NALU_TYPE_BITMASK == STAPA_NALU_TYPE)
+            .count(),
+        1,
+        "one STAP-A per access unit, not one per slice"
+    );
+
+    let p_frame = Bytes::from_static(&[0x00, 0x00, 0x00, 0x01, 0x41, 0xaa, 0xbb]);
+    let second = pck.payload(1500, &p_frame)?;
+    assert_eq!(
+        second,
+        vec![Bytes::from_static(&[0x41, 0xaa, 0xbb])],
+        "a predicted frame does not repeat the parameter sets"
+    );
+
+    let bare_idr = Bytes::from_static(&[0x00, 0x00, 0x00, 0x01, 0x65, 0xee, 0xff]);
+    let third = pck.payload(1500, &bare_idr)?;
+    assert_eq!(
+        third.len(),
+        2,
+        "an IDR the encoder sent bare still carries them"
+    );
+    assert_eq!(third[0][0] & NALU_TYPE_BITMASK, STAPA_NALU_TYPE);
+    assert_eq!(third[1], Bytes::from_static(&[0x65, 0xee, 0xff]));
+
+    Ok(())
+}

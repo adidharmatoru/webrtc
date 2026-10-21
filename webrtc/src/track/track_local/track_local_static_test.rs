@@ -488,6 +488,9 @@ async fn vp8_payload_sizes(options: SampleTrackOptions) -> Result<Vec<usize>> {
             ..Default::default()
         })
         .await?;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
 
     let sizes = sizes.0.lock().unwrap().clone();
     Ok(sizes)
@@ -504,6 +507,111 @@ async fn test_track_local_static_sample_honours_outbound_mtu() -> Result<()> {
     assert!(default_sizes.iter().copied().max().unwrap() > 400);
     assert!(small_sizes.iter().copied().max().unwrap() <= 400);
     assert!(small_sizes.len() > default_sizes.len());
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StalledTransport;
+
+#[async_trait]
+impl TrackLocalWriter for StalledTransport {
+    async fn write_rtp_with_attributes(
+        &self,
+        _pkt: &rtp::packet::Packet,
+        _attr: &Attributes,
+    ) -> Result<usize> {
+        std::future::pending().await
+    }
+}
+
+#[derive(Debug)]
+struct CountingTransport(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl TrackLocalWriter for CountingTransport {
+    async fn write_rtp_with_attributes(
+        &self,
+        pkt: &rtp::packet::Packet,
+        _attr: &Attributes,
+    ) -> Result<usize> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(pkt.payload.len())
+    }
+}
+
+fn vp8_binding(
+    id: &str,
+    ssrc: u32,
+    write_stream: Arc<dyn TrackLocalWriter + Send + Sync>,
+) -> TrackLocalContext {
+    TrackLocalContext {
+        id: id.to_owned(),
+        params: RTCRtpParameters {
+            codecs: vec![RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_VP8.to_owned(),
+                    clock_rate: 90000,
+                    ..Default::default()
+                },
+                payload_type: 96,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        ssrc,
+        write_stream,
+        paused: Arc::new(AtomicBool::new(false)),
+        mid: None,
+    }
+}
+
+// A binding whose transport cannot keep up (a TCP TURN path with a full send buffer) must not
+// hold the writer or delay the other viewers bound to the same track.
+#[tokio::test]
+async fn test_track_local_static_a_stalled_binding_never_blocks_the_others() -> Result<()> {
+    let track = TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_VP8.to_owned(),
+            clock_rate: 90000,
+            ..Default::default()
+        },
+        "video".to_owned(),
+        "webrtc-rs".to_owned(),
+    );
+    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    track
+        .bind(&vp8_binding("stalled", 1, Arc::new(StalledTransport)))
+        .await?;
+    track
+        .bind(&vp8_binding(
+            "healthy",
+            2,
+            Arc::new(CountingTransport(Arc::clone(&delivered))),
+        ))
+        .await?;
+
+    let packets = BINDING_OUTBOX_PACKETS + 100;
+    for sequence_number in 0..packets {
+        let pkt = rtp::packet::Packet {
+            header: rtp::header::Header {
+                sequence_number: sequence_number as u16,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(&[0u8; 100]),
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), track.write_rtp(&pkt))
+            .await
+            .expect("a stalled binding must not block the writer")?;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while delivered.load(std::sync::atomic::Ordering::SeqCst) < packets {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every packet reaches the healthy binding while the other stalls");
 
     Ok(())
 }

@@ -16,6 +16,7 @@ pub struct H264Payloader {
 pub const STAPA_NALU_TYPE: u8 = 24;
 pub const FUA_NALU_TYPE: u8 = 28;
 pub const FUB_NALU_TYPE: u8 = 29;
+pub const IDR_NALU_TYPE: u8 = 5;
 pub const SPS_NALU_TYPE: u8 = 7;
 pub const PPS_NALU_TYPE: u8 = 8;
 pub const AUD_NALU_TYPE: u8 = 9;
@@ -52,7 +53,7 @@ impl H264Payloader {
         (-1, -1)
     }
 
-    fn emit(&mut self, nalu: &Bytes, mtu: usize, payloads: &mut Vec<Bytes>) {
+    fn emit(&mut self, nalu: &Bytes, mtu: usize, payloads: &mut Vec<Bytes>, stap_a: &mut bool) {
         if nalu.is_empty() {
             return;
         }
@@ -74,11 +75,16 @@ impl H264Payloader {
             return;
         }
 
-        // When both parameter sets are collected, emit STAP-A before the current slice NALU.
-        // SPS/PPS are kept cached (not cleared) so STAP-A is emitted before every frame,
-        // not just IDR frames. This ensures decoders always have fresh parameter sets,
-        // which is required by some browsers (e.g. Chrome) for stable H264 WebRTC decoding.
-        if let (Some(sps_nalu), Some(pps_nalu)) = (&self.sps_nalu, &self.pps_nalu) {
+        // When both parameter sets are collected, emit STAP-A once per IDR access unit, before its
+        // first non-parameter NALU. SPS/PPS stay cached, so an IDR the encoder sent without them
+        // still carries them for a decoder that joins or recovers there.
+        let parameter_sets = if *stap_a {
+            self.sps_nalu.as_ref().zip(self.pps_nalu.as_ref())
+        } else {
+            None
+        };
+        if let Some((sps_nalu, pps_nalu)) = parameter_sets {
+            *stap_a = false;
             let sps_len = (sps_nalu.len() as u16).to_be_bytes();
             let pps_len = (pps_nalu.len() as u16).to_be_bytes();
 
@@ -150,31 +156,33 @@ impl Payloader for H264Payloader {
         }
 
         let mut payloads = vec![];
+        let mut nalus = vec![];
 
         // Find first start code
         let (mut start, mut sc_len) = H264Payloader::next_ind(payload, 0);
         if start < 0 {
             // No start codes found, treat entire payload as single NALU
-            self.emit(payload, mtu, &mut payloads);
-            return Ok(payloads);
+            nalus.push(payload.clone());
+        } else {
+            loop {
+                let nalu_start = (start + sc_len) as usize;
+                let (next_start, next_sc_len) = H264Payloader::next_ind(payload, nalu_start);
+                if next_start < 0 {
+                    // Last NALU
+                    nalus.push(payload.slice(nalu_start..));
+                    break;
+                }
+                nalus.push(payload.slice(nalu_start..next_start as usize));
+                start = next_start;
+                sc_len = next_sc_len;
+            }
         }
 
-        loop {
-            let nalu_start = (start + sc_len) as usize;
-            let (next_start, next_sc_len) = H264Payloader::next_ind(payload, nalu_start);
-            if next_start < 0 {
-                // Last NALU
-                self.emit(&payload.slice(nalu_start..), mtu, &mut payloads);
-                break;
-            } else {
-                self.emit(
-                    &payload.slice(nalu_start..next_start as usize),
-                    mtu,
-                    &mut payloads,
-                );
-            }
-            start = next_start;
-            sc_len = next_sc_len;
+        let mut stap_a = nalus
+            .iter()
+            .any(|nalu| nalu.first().map(|b| b & NALU_TYPE_BITMASK) == Some(IDR_NALU_TYPE));
+        for nalu in &nalus {
+            self.emit(nalu, mtu, &mut payloads, &mut stap_a);
         }
 
         Ok(payloads)

@@ -137,9 +137,11 @@ pub(crate) struct TrackBinding {
     ssrc: SSRC,
     payload_type: PayloadType,
     params: RTCRtpParameters,
-    write_stream: Arc<dyn TrackLocalWriter + Send + Sync>,
     sender_paused: Arc<AtomicBool>,
     hdr_ext_ids: Vec<rtp::header::Extension>,
+    /// Packets waiting for this binding's own send task, so a transport that cannot keep up
+    /// holds back only its own packets, never the writer or the other bindings.
+    outbox: tokio::sync::mpsc::Sender<(rtp::packet::Packet, Attributes)>,
 }
 
 impl TrackBinding {
